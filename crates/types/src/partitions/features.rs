@@ -16,7 +16,9 @@ use crate::storage::{
     StorageCodecKind, StorageDecode, StorageDecodeError, StorageEncode, StorageEncodeError, decode,
     encode,
 };
-use crate::{RESTATE_VERSION_1_6_0, RESTATE_VERSION_1_7_0, SemanticRestateVersion};
+use crate::{
+    RESTATE_VERSION_1_6_0, RESTATE_VERSION_1_7_0, RESTATE_VERSION_1_8_0, SemanticRestateVersion,
+};
 
 /// A change to the set of state-machine features enabled on a partition.
 ///
@@ -58,6 +60,13 @@ pub enum PartitionFeatureChange {
     ///
     /// *Since v1.7.0*
     EnableUniqueRandomSeeds = 3,
+
+    /// Write a reference to the output journal
+    /// instead of embedding the invocation result
+    /// in the completion status.
+    ///
+    /// *Since v1.8.0*
+    EnableWriteResultReference,
 }
 
 impl PartitionFeatureChange {
@@ -74,6 +83,7 @@ impl PartitionFeatureChange {
             Self::EnableJournalV2 => &RESTATE_VERSION_1_6_0,
             Self::EnableVqueues => &RESTATE_VERSION_1_7_0,
             Self::EnableUniqueRandomSeeds => &RESTATE_VERSION_1_7_0,
+            Self::EnableWriteResultReference => &RESTATE_VERSION_1_8_0,
         }
     }
 
@@ -85,6 +95,9 @@ impl PartitionFeatureChange {
             Self::EnableVqueues => !std::mem::replace(&mut features.vqueues, true),
             Self::EnableUniqueRandomSeeds => {
                 !std::mem::replace(&mut features.unique_random_seeds, true)
+            }
+            Self::EnableWriteResultReference => {
+                !std::mem::replace(&mut features.write_result_reference, true)
             }
         }
     }
@@ -130,6 +143,14 @@ pub struct PersistedFeatures {
     /// *Since v1.7.0*
     #[bilrost(tag(3))]
     pub unique_random_seeds: bool,
+
+    /// Write a reference to the output journal
+    /// instead of embedding the invocation result
+    /// in the completion status.
+    ///
+    /// *Since v1.8.0*
+    #[bilrost(tag(4))]
+    pub write_result_reference: bool,
 }
 
 impl PersistedFeatures {
