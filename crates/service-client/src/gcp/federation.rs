@@ -195,14 +195,64 @@ impl Broker {
                 return Ok(creds.clone());
             }
         }
-        let fresh = self.provider.provide_credentials().await.map_err(|e| {
-            FederationError::transient(format!(
-                "assuming the GCP workload identity federation broker role: {e}"
-            ))
-        })?;
+        let fresh = self
+            .provider
+            .provide_credentials()
+            .await
+            .map_err(|e| federation_error_from_assume_role_failure(&e))?;
         *guard = Some(fresh.clone());
         Ok(fresh)
     }
+}
+
+/// Classifies an `sts:AssumeRole` failure surfaced by `AssumeRoleProvider::provide_credentials()`.
+///
+/// Authorization failures (the broker role's trust policy rejecting the caller, or an IAM policy
+/// denying `sts:AssumeRole`) are permanent: no amount of retrying fixes them without an operator
+/// changing IAM. Classifying them as transient meant the external-account credential's refresh
+/// loop retried an `AccessDenied` every `SHORT_REFRESH_SLACK` (10s, google-cloud-auth's constant)
+/// forever instead of publishing a permanent error and exiting -- which is what lets
+/// [`super::SourceSlot`]'s probe-and-replace recovery rebuild the source once IAM is fixed.
+/// Network/dispatch/timeout/credential-chain-resolution failures never reach a service response
+/// at all and stay transient, since those genuinely can resolve on retry.
+fn federation_error_from_assume_role_failure(
+    error: &aws_credential_types::provider::error::CredentialsError,
+) -> FederationError {
+    let message = format!("assuming the GCP workload identity federation broker role: {error}");
+    if assume_role_error_code(error).is_some_and(is_access_denied_code) {
+        FederationError::permanent(message)
+    } else {
+        FederationError::transient(message)
+    }
+}
+
+fn is_access_denied_code(code: &str) -> bool {
+    code == "AccessDenied" || code == "AccessDeniedException"
+}
+
+/// Walks `error`'s source chain for the `SdkError<AssumeRoleError>` `AssumeRoleProvider` wraps its
+/// STS response errors in (see `aws_config::sts::assume_role::Inner::credentials`), and returns
+/// the STS wire error code from it, if any -- classifying on a structured field of the response
+/// rather than by matching the human-readable `Display` text.
+///
+/// `AssumeRole`'s `AccessDenied` has no modeled exception variant in `AssumeRoleError` (aws-sdk-sts
+/// 1.111 models only `ExpiredTokenException`, `MalformedPolicyDocumentException`,
+/// `PackedPolicyTooLargeException`, and `RegionDisabledException`), so it always surfaces through
+/// the catch-all `Unhandled` variant; `ProvideErrorMetadata::code()` still recovers the wire error
+/// code for unmodeled errors, which is why this checks the code rather than matching on the
+/// service-error enum's variants.
+fn assume_role_error_code<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a str> {
+    use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
+    use aws_sdk_sts::operation::assume_role::AssumeRoleError;
+
+    let mut cause = Some(error);
+    while let Some(err) = cause {
+        if let Some(sdk_error) = err.downcast_ref::<SdkError<AssumeRoleError>>() {
+            return sdk_error.code();
+        }
+        cause = err.source();
+    }
+    None
 }
 
 static BROKER: OnceCell<Arc<Broker>> = OnceCell::const_new();
@@ -628,6 +678,7 @@ mod federation_tests {
     use std::time::{Duration, SystemTime};
 
     use aws_credential_types::Credentials as AwsCredentials;
+    use google_cloud_auth::errors::SubjectTokenProviderError;
 
     use super::build_subject_token;
 
@@ -1031,5 +1082,74 @@ mod federation_tests {
             session_name: "has a space".to_owned(),
         };
         super::install_config(Some(config)).expect_err("invalid session-name must be rejected");
+    }
+
+    fn assume_role_access_denied_error() -> aws_credential_types::provider::error::CredentialsError
+    {
+        use aws_sdk_sts::error::SdkError;
+        use aws_sdk_sts::operation::assume_role::AssumeRoleError;
+        use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+        use aws_smithy_runtime_api::http::StatusCode;
+        use aws_smithy_types::body::SdkBody;
+        use aws_smithy_types::error::ErrorMetadata;
+
+        let service_error = AssumeRoleError::generic(
+            ErrorMetadata::builder()
+                .code("AccessDenied")
+                .message(
+                    "User: arn:aws:sts::123456789012:assumed-role/... is not authorized to \
+                     perform: sts:AssumeRole on resource: ...",
+                )
+                .build(),
+        );
+        let raw = HttpResponse::new(
+            StatusCode::try_from(403).unwrap(),
+            SdkBody::from("<AccessDenied/>"),
+        );
+        aws_credential_types::provider::error::CredentialsError::provider_error(
+            SdkError::service_error(service_error, raw),
+        )
+    }
+
+    fn assume_role_dispatch_timeout_error()
+    -> aws_credential_types::provider::error::CredentialsError {
+        use aws_sdk_sts::error::SdkError;
+        use aws_sdk_sts::operation::assume_role::AssumeRoleError;
+
+        let sdk_error: SdkError<AssumeRoleError> =
+            SdkError::timeout_error("connect timed out reaching sts.us-east-1.amazonaws.com");
+        aws_credential_types::provider::error::CredentialsError::provider_error(sdk_error)
+    }
+
+    #[test]
+    fn assume_role_access_denied_classifies_permanent() {
+        let error =
+            super::federation_error_from_assume_role_failure(&assume_role_access_denied_error());
+        assert!(
+            !error.is_transient(),
+            "an AssumeRole AccessDenied must classify as permanent, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn assume_role_dispatch_timeout_classifies_transient() {
+        let error =
+            super::federation_error_from_assume_role_failure(&assume_role_dispatch_timeout_error());
+        assert!(
+            error.is_transient(),
+            "an AssumeRole connector/timeout failure must classify as transient, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn assume_role_error_code_recovers_the_wire_error_code_through_credentials_error() {
+        assert_eq!(
+            super::assume_role_error_code(&assume_role_access_denied_error()),
+            Some("AccessDenied")
+        );
+        assert_eq!(
+            super::assume_role_error_code(&assume_role_dispatch_timeout_error()),
+            None
+        );
     }
 }

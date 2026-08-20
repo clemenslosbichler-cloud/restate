@@ -64,6 +64,8 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 restate-service-client = { path = ".", features = ["test_util"] }
+aws-smithy-runtime-api = { workspace = true }
+aws-smithy-types = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 googletest = { workspace = true }
 hyper = { workspace = true, features = ["server"] }
