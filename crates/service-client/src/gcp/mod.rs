@@ -175,9 +175,32 @@ impl From<google_cloud_auth::errors::CredentialsError> for SourceError {
     fn from(error: google_cloud_auth::errors::CredentialsError) -> Self {
         Self {
             transient: error.is_transient(),
-            message: error.to_string(),
+            message: display_error_chain(&error),
         }
     }
+}
+
+/// Renders `error`'s `Display` together with its full `source()` chain, each level separated by
+/// `": "`.
+///
+/// `google_cloud_auth`'s `CredentialsError::Display` only ever prints its own top-level message
+/// (e.g. "failed to fetch ID token via impersonation and future attempts will not succeed") --
+/// the detail an operator actually needs, such as a `google_cloud_gax::error::Error` carrying the
+/// HTTP status code and response body from a failed `iamcredentials.googleapis.com` call (e.g.
+/// "the HTTP transport reports a [403] error: {"error":{"code":403,"status":"PERMISSION_DENIED",
+/// ...}}"), lives one or more levels down its `source()` chain, which `Display` never visits.
+/// Without this, a missing `roles/iam.serviceAccountOpenIdTokenCreator` binding -- the single most
+/// common federation/impersonation misconfiguration -- surfaced as an opaque, undiagnosable
+/// message in both `restate dp register` errors and server logs.
+fn display_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(err) = cause {
+        message.push_str(": ");
+        message.push_str(&err.to_string());
+        cause = err.source();
+    }
+    message
 }
 
 /// Internal seam that keeps the registry and the mint path testable without ADC or network:
@@ -916,6 +939,32 @@ mod tests {
         // Leak-free: must not surface the google-cloud-auth internal API hint.
         assert!(!msg.contains("idtoken::user_account"), "{msg}");
         assert!(!msg.to_lowercase().contains("builder directly"), "{msg}");
+    }
+
+    /// The single most common federation/impersonation misconfiguration -- a customer forgetting
+    /// to grant `roles/iam.serviceAccountOpenIdTokenCreator` on the invocation service account --
+    /// surfaces from `iamcredentials.googleapis.com` as a 403 with a `PERMISSION_DENIED` status in
+    /// the JSON body. `CredentialsError::Display` alone drops this (it only prints its own
+    /// top-level message); `SourceError::from` must recover it from the source chain so it reaches
+    /// `GcpAuthError::Mint`'s message, legible in `restate dp register` errors and server logs.
+    #[test]
+    fn credentials_error_403_permission_denied_survives_into_source_error() {
+        let body = br#"{"error":{"code":403,"message":"The caller does not have permission","status":"PERMISSION_DENIED"}}"#;
+        let gax_error = google_cloud_gax::error::Error::http(
+            403,
+            http::HeaderMap::new(),
+            bytes::Bytes::from_static(body),
+        );
+        let credentials_error = google_cloud_auth::errors::CredentialsError::new(
+            false,
+            "failed to fetch ID token via impersonation",
+            gax_error,
+        );
+
+        let source_error = SourceError::from(credentials_error);
+        let message = source_error.to_string();
+        assert!(message.contains("403"), "{message}");
+        assert!(message.contains("PERMISSION_DENIED"), "{message}");
     }
 
     struct MockSource {
