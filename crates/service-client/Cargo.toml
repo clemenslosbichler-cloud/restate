@@ -68,6 +68,7 @@ aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
 googletest = { workspace = true }
+google-cloud-gax = { version = "1.13.0" }
 hyper = { workspace = true, features = ["server"] }
 pprof = { version = "0.15", features = ["criterion", "flamegraph"] }
 tempfile = { workspace = true }
